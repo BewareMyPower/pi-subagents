@@ -97,6 +97,9 @@ test("detached launch ignores a whitespace-only package-root override", async (t
 	assert.ok(manifests.length > 0, "fixture must start with a detectable npm root");
 	const exists = fs.existsSync;
 	t.mock.method(fs, "existsSync", (file) => manifests.includes(String(file)) ? false : exists(file));
+	// The fixture hides every host and install root; the global npm probe is the machine's
+	// real path, so npm must read as unreachable here too.
+	t.mock.method(childProcess, "execFileSync", () => { throw new Error("npm unavailable in fixture"); });
 	const spawn = t.mock.method(childProcess, "spawn", () => { throw new Error("must not spawn"); });
 	syncBuiltinESMExports();
 	try {
@@ -133,6 +136,7 @@ test("npm detached launch fails closed when the detected package root is absent"
 	assert.ok(manifests.length > 0, "fixture must start with a detectable npm root");
 	const exists = fs.existsSync;
 	t.mock.method(fs, "existsSync", (file) => manifests.includes(String(file)) ? false : exists(file));
+	t.mock.method(childProcess, "execFileSync", () => { throw new Error("npm unavailable in fixture"); });
 	const spawn = t.mock.method(childProcess, "spawn", () => { throw new Error("must not spawn"); });
 	syncBuiltinESMExports();
 	try {

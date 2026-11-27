@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -80,6 +81,7 @@ export function resolveHostPiPackageRoot(deps: PiSpawnDeps = {}): string | undef
 export interface PiSpawnDeps {
 	platform?: NodeJS.Platform;
 	execPath?: string;
+	execFileSync?: (command: string, args: string[], options: { encoding: "utf-8"; timeout: number; stdio: ["ignore", "pipe", "ignore"] }) => string;
 	argv1?: string;
 	bunVersion?: string;
 	existsSync?: (filePath: string) => boolean;
@@ -155,6 +157,54 @@ type PiPackageSelection =
 	| { root: string; cliScript: string }
 	| { root: string; packageJson: PiPackageJson; authoritative: boolean };
 
+/**
+ * Probe the global npm installation, mirroring the async resolver in
+ * src/agents/global-npm-root.ts: offline mode skips the probe, Windows resolves APPDATA
+ * without invoking npm, and the output is canonicalized. This copy is synchronous because
+ * package selection runs in synchronous launch paths; an embedded host — a daemon that
+ * bundles Pi into its own image — has no package root of its own, yet a runner only needs
+ * one compatible copy of the package: the machine's global install is exactly that.
+ * Discovery never consulted it, so an embedded host with a global Pi present still failed
+ * every background launch.
+ */
+export function resolveGlobalNpmPiPackageRoot(deps: PiSpawnDeps = {}): string | undefined {
+	const env = deps.env ?? process.env;
+	const offline = env.PI_OFFLINE?.toLowerCase();
+	if (offline === "1" || offline === "true" || offline === "yes") return undefined;
+	const existsSync = deps.existsSync ?? fs.existsSync;
+	const realpathSync = deps.realpathSync ?? fs.realpathSync;
+
+	let npmRoot: string | undefined;
+	if ((deps.platform ?? process.platform) === "win32" && env.APPDATA) {
+		const appDataRoot = path.join(env.APPDATA, "npm", "node_modules");
+		if (existsSync(appDataRoot)) npmRoot = appDataRoot;
+	}
+	if (!npmRoot) {
+		const execFileSyncImpl = deps.execFileSync ?? execFileSync;
+		try {
+			npmRoot = String(execFileSyncImpl("npm", ["root", "-g"], { encoding: "utf-8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"] })).trim();
+		} catch {
+			return undefined;
+		}
+	}
+	if (!npmRoot) return undefined;
+	try {
+		npmRoot = realpathSync(npmRoot);
+	} catch {
+		return undefined;
+	}
+	const readFileSyncImpl = deps.readFileSync ?? ((filePath: string) => fs.readFileSync(filePath, "utf-8"));
+	const root = path.join(npmRoot, PI_CODING_AGENT_PACKAGE);
+	const packageJsonPath = path.join(root, "package.json");
+	if (!existsSync(packageJsonPath)) return undefined;
+	try {
+		const pkg = JSON.parse(readFileSyncImpl(packageJsonPath, "utf-8")) as { name?: unknown };
+		return pkg.name === PI_CODING_AGENT_PACKAGE ? root : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 /** Preserve direct JS launches; extensionless .bin/pi launchers must honor explicit roots first. */
 function selectPiPackage(deps: PiSpawnDeps): PiPackageSelection | undefined {
 	const existsSync = deps.existsSync ?? fs.existsSync;
@@ -199,6 +249,14 @@ function selectPiPackage(deps: PiSpawnDeps): PiPackageSelection | undefined {
 		} catch {
 			// No authoritative host root was found; keep probing the extension install.
 		}
+	}
+
+	// Last resort: the machine's global install. A published pi-subagents tree carries no
+	// pi-coding-agent of its own (it is a devDependency), so an embedded host without this
+	// probe fails every background launch even when a compatible copy is one lookup away.
+	const globalRoot = resolveGlobalNpmPiPackageRoot(deps);
+	if (globalRoot) {
+		return { root: globalRoot, packageJson: readPiPackageJson(path.join(globalRoot, "package.json"), deps.readFileSync), authoritative: true };
 	}
 	return undefined;
 }
